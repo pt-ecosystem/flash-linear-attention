@@ -435,17 +435,29 @@ def _cpu_device_warning():
 @functools.cache
 def get_multiprocessor_count(tensor_idx: int = 0) -> int:
     try:
-        return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['multiprocessor_count']
+        backend = triton.runtime.driver.active.get_current_target().backend
+        props = triton.runtime.driver.active.utils.get_device_properties(tensor_idx)
+        if backend == 'npu':
+            return props['num_vectorcore']
+        return props['multiprocessor_count']
     except BaseException:
-        # Maybe we use a NPU device.
-        if triton.runtime.driver.active.get_current_target().backend == 'npu':
-            return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['num_vectorcore']
-        else:
-            return 1
+        return 1
 
 
 @functools.cache
 def get_available_device() -> str:
+    """Resolve Triton runtime device kind (``cuda`` / ``hip`` / ``npu`` / ...).
+
+    On Ascend, avoid probing ``triton.runtime.driver.active`` before ``torch.npu`` is
+    usable: the first access constructs the NPUDriver and may load native code that
+    depends on ``libtorch_npu.so`` (fails if CANN / torch_npu env is incomplete).
+    """
+    if hasattr(torch, 'npu'):
+        try:
+            if torch.npu.is_available():
+                return 'npu'
+        except Exception:
+            pass
     try:
         return triton.runtime.driver.active.get_current_target().backend
     except BaseException:
