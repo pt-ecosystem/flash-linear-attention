@@ -25,8 +25,9 @@ class GatedDeltaRuleTritonAscendBackend(BaseBackend):
 
     Active when ``IS_NPU`` and ``torch.npu`` are available. Disable with ``FLA_TRITON_ASCEND=0``.
 
-    Dispatched entry points mirror ``@dispatch("gated_delta_rule")`` on the default
-    implementations under ``fla.ops.gated_delta_rule`` (chunk_fwd / gate / wy_fast / fused_recurrent).
+    Dispatched entry points mirror ``@dispatch("gated_delta_rule")`` on default implementations
+    under ``fla.ops.gated_delta_rule`` (chunk_fwd / gate / wy_fast / fused_recurrent).
+    Shared common/utils ops use ``common`` and ``utils`` registries respectively.
     """
 
     backend_type = "triton-ascend"

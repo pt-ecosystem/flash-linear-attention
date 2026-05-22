@@ -9,7 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
@@ -596,7 +595,6 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             tl.store(p_dh3, b_dh4.to(p_dh3.dtype.element_ty), boundary_check=(0, 1))
 
 
-@dispatch('common')
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -656,7 +654,6 @@ def chunk_gated_delta_rule_fwd_h(
     return h, v_new, final_state
 
 
-@dispatch('common')
 def chunk_gated_delta_rule_bwd_dhu(
     q: torch.Tensor,
     k: torch.Tensor,
