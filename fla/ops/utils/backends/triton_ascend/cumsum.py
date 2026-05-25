@@ -9,25 +9,19 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.utils import autotune_cache_kwargs, check_shared_mem, input_guard
+from fla.utils import input_guard
 
-BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+# Fixed launch for Ascend: autotune bench causes 507014 timeouts on NPU.
+NPU_NUM_WARPS = 2
+NPU_NUM_STAGES = 1
+NPU_BS = 32
 
 
 @triton.heuristics({
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@fla_cache_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_local_cumsum_scalar_kernel(
     s,
@@ -64,9 +58,9 @@ def chunk_local_cumsum_scalar_kernel(
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
-        b_o = -b_o + b_z[None] + b_s
+        b_o = b_s + b_z[None] - b_o
     if HAS_SCALE:
-        b_o *= scale
+        b_o = b_o * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
@@ -74,15 +68,6 @@ def chunk_local_cumsum_scalar_kernel(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@fla_cache_autotune(
-    configs=[
-        triton.Config({'BS': BS}, num_warps=num_warps)
-        for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-    ],
-    key=['B', 'H', 'S', 'BT', 'IS_VARLEN', 'REVERSE'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_local_cumsum_vector_kernel(
     s,
@@ -123,7 +108,7 @@ def chunk_local_cumsum_vector_kernel(
     else:
         b_o = tl.cumsum(b_s, axis=0)
     if HAS_SCALE:
-        b_o *= scale
+        b_o = b_o * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -131,16 +116,6 @@ def chunk_local_cumsum_vector_kernel(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps, num_stages=num_stages)
-        for BT in [32, 64, 128, 256]
-        for num_warps in [2, 4, 8]
-        for num_stages in [1, 2, 3, 4]
-    ],
-    key=['B', 'H', 'IS_VARLEN', 'REVERSE'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_global_cumsum_scalar_kernel(
     s,
@@ -178,12 +153,12 @@ def chunk_global_cumsum_scalar_kernel(
         b_o = tl.cumsum(b_s, axis=0)
         b_ss = tl.sum(b_s, 0)
         if REVERSE:
-            b_o = -b_o + b_ss + b_s
-        b_o += b_z
+            b_o = b_s + b_ss - b_o
+        b_o = b_o + b_z
         if i_c >= 0:
             b_z += b_ss
         if HAS_SCALE:
-            b_o *= scale
+            b_o = b_o * scale
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
@@ -191,16 +166,6 @@ def chunk_global_cumsum_scalar_kernel(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps, num_stages=num_stages)
-        for BT in [16, 32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [1, 2, 3, 4]
-    ],
-    key=['B', 'H', 'S', 'IS_VARLEN', 'REVERSE'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_global_cumsum_vector_kernel(
     s,
@@ -243,7 +208,7 @@ def chunk_global_cumsum_vector_kernel(
         else:
             b_c = b_z[None, :] + tl.cumsum(b_s, axis=0)
         if HAS_SCALE:
-            b_c *= scale
+            b_c = b_c * scale
         tl.store(p_o, b_c.to(p_o.dtype.element_ty), boundary_check=(0, 1))
         b_z += tl.sum(b_s, 0)
 
@@ -281,6 +246,8 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
     return g
 
@@ -306,10 +273,8 @@ def chunk_local_cumsum_vector(
     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
-    def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
-    # keep cummulative normalizer in fp32
-    # this kernel is equivalent to
-    # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
+    BS = min(NPU_BS, triton.next_power_of_2(S))
+    grid = (triton.cdiv(S, BS), NT, B * H)
     chunk_local_cumsum_vector_kernel[grid](
         s=g_org,
         o=g,
@@ -321,8 +286,11 @@ def chunk_local_cumsum_vector(
         H=H,
         S=S,
         BT=BT,
+        BS=BS,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
     return g
 
@@ -352,8 +320,11 @@ def chunk_global_cumsum_scalar(
         T=T,
         B=B,
         H=H,
+        BT=64,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
     return z
 
@@ -385,9 +356,12 @@ def chunk_global_cumsum_vector(
         B=B,
         H=H,
         S=S,
+        BT=64,
         BS=BS,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
     return z
 

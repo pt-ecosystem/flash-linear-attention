@@ -10,11 +10,17 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
-from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import IS_NVIDIA_HOPPER, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
 
-NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
+# Ascend UB: avoid autotune; tile V/time/K to stay within ~192KB UB.
+NPU_NUM_WARPS = 2
+NPU_NUM_STAGES = 1
+NPU_BV = 8
+NPU_BC = 64
+NPU_BK = 16
+# K=64 dedicated path: 2×BK slabs + smaller time tiles to fit UB.
+NPU_BC_K64 = 16
+NPU_BK_K64 = 32
 
 
 @triton.heuristics({
@@ -25,17 +31,6 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
     'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@fla_cache_autotune(
-    configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
-    use_cuda_graph=USE_CUDA_GRAPH,
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -56,6 +51,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
+    BC: tl.constexpr,
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -159,55 +155,57 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 p_h4 = tl.make_block_ptr(h + i_t_int64 * HV*K*V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
-        p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
-        b_w = tl.load(p_w, boundary_check=(0, 1))
-        if STATE_V_FIRST:
-            b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
-        else:
-            b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
-        if K > 64:
-            p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            if STATE_V_FIRST:
-                b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
-            else:
-                b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
-        if K > 128:
-            p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            if STATE_V_FIRST:
-                b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype))
-            else:
-                b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
-        if K > 192:
-            p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            if STATE_V_FIRST:
-                b_v += tl.dot(b_w, tl.trans(b_h4).to(b_w.dtype))
-            else:
-                b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
-        p_v = tl.make_block_ptr(v, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
-
-        if SAVE_NEW_VALUE:
-            p_v = tl.make_block_ptr(v_new, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
-
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
-            m_t = (i_t * BT + tl.arange(0, BT)) < T
             b_g_last = tl.load(g + (bos * HV + last_idx * HV + i_h).to(tl.int64)).to(tl.float32)
-            p_g = tl.make_block_ptr(g + (bos * HV + i_h).to(tl.int64), (T,), (HV,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
-            b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
-            b_g_last = exp2(b_g_last)
-            b_h1 *= b_g_last
+            b_g_last_exp = exp2(b_g_last)
+
+        # Phase 1: u = v - w@h; store ungated u in v_new (chunk_fwd_o expects GPU layout).
+        for i_bc in tl.static_range(BT // BC):
+            t_off = i_t * BT + i_bc * BC
+            p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (t_off, 0), (BC, 64), (1, 0))
+            b_w = tl.load(p_w, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
+            else:
+                b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
             if K > 64:
-                b_h2 *= b_g_last
+                p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (t_off, 64), (BC, 64), (1, 0))
+                b_w = tl.load(p_w, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
+                else:
+                    b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
             if K > 128:
-                b_h3 *= b_g_last
+                p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (t_off, 128), (BC, 64), (1, 0))
+                b_w = tl.load(p_w, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype))
+                else:
+                    b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
             if K > 192:
-                b_h4 *= b_g_last
+                p_w = tl.make_block_ptr(w, (T, K), (HV*K, 1), (t_off, 192), (BC, 64), (1, 0))
+                b_w = tl.load(p_w, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_v += tl.dot(b_w, tl.trans(b_h4).to(b_w.dtype))
+                else:
+                    b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
+            p_v = tl.make_block_ptr(v, (T, V), (HV*V, 1), (t_off, i_v * BV), (BC, BV), (1, 0))
+            b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32) - b_v
+
+            if SAVE_NEW_VALUE:
+                p_vn = tl.make_block_ptr(v_new, (T, V), (HV*V, 1), (t_off, i_v * BV), (BC, BV), (1, 0))
+                tl.store(p_vn, b_v.to(p_vn.dtype.element_ty), boundary_check=(0, 1))
+
+        # Phase 2: chunk-end decay on h (GPU / naive: before k@u').
+        if USE_G:
+            b_h1 *= b_g_last_exp
+            if K > 64:
+                b_h2 *= b_g_last_exp
+            if K > 128:
+                b_h3 *= b_g_last_exp
+            if K > 192:
+                b_h4 *= b_g_last_exp
 
         if USE_GK:
             o_k1 = tl.arange(0, 64)
@@ -237,35 +235,46 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     b_h4 *= exp2(b_gk_last4)[None, :]
                 else:
                     b_h4 *= exp2(b_gk_last4)[:, None]
-        b_v = b_v.to(k.dtype.element_ty)
 
-        p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, i_t * BT), (64, BT), (0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        if STATE_V_FIRST:
-            b_h1 += tl.trans(tl.dot(b_k, b_v))
-        else:
-            b_h1 += tl.dot(b_k, b_v)
-        if K > 64:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (64, i_t * BT), (64, BT), (0, 1))
+        # Phase 3: row-gate u from v_new, then h += k @ u (GPU: after h *= g_last).
+        for i_bc in tl.static_range(BT // BC):
+            t_off = i_t * BT + i_bc * BC
+            p_vn = tl.make_block_ptr(v_new, (T, V), (HV*V, 1), (t_off, i_v * BV), (BC, BV), (1, 0))
+            b_v = tl.load(p_vn, boundary_check=(0, 1)).to(tl.float32)
+            if USE_G:
+                m_t = (t_off + tl.arange(0, BC)) < T
+                p_g = tl.make_block_ptr(g + (bos * HV + i_h).to(tl.int64), (T,), (HV,), (t_off,), (BC,), (0,))
+                b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+                b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
+            b_v = b_v.to(k.dtype.element_ty)
+
+            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, t_off), (64, BC), (0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if STATE_V_FIRST:
-                b_h2 += tl.trans(tl.dot(b_k, b_v))
+                b_h1 += tl.trans(tl.dot(b_k, b_v))
             else:
-                b_h2 += tl.dot(b_k, b_v)
-        if K > 128:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (128, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            if STATE_V_FIRST:
-                b_h3 += tl.trans(tl.dot(b_k, b_v))
-            else:
-                b_h3 += tl.dot(b_k, b_v)
-        if K > 192:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (192, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            if STATE_V_FIRST:
-                b_h4 += tl.trans(tl.dot(b_k, b_v))
-            else:
-                b_h4 += tl.dot(b_k, b_v)
+                b_h1 += tl.dot(b_k, b_v)
+            if K > 64:
+                p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (64, t_off), (64, BC), (0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_h2 += tl.trans(tl.dot(b_k, b_v))
+                else:
+                    b_h2 += tl.dot(b_k, b_v)
+            if K > 128:
+                p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (128, t_off), (64, BC), (0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_h3 += tl.trans(tl.dot(b_k, b_v))
+                else:
+                    b_h3 += tl.dot(b_k, b_v)
+            if K > 192:
+                p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (192, t_off), (64, BC), (0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_h4 += tl.trans(tl.dot(b_k, b_v))
+                else:
+                    b_h4 += tl.dot(b_k, b_v)
 
     if STORE_FINAL_STATE:
         if STATE_V_FIRST:
@@ -296,21 +305,164 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_GK': lambda args: args['gk'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
+    'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
+    'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit(do_not_specialize=['T'])
+def chunk_gated_delta_rule_fwd_kernel_h_k64_npu(
+    k,
+    v,
+    w,
+    v_new,
+    g,
+    gk,
+    h,
+    h0,
+    ht,
+    cu_seqlens,
+    chunk_offsets,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_GK: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    SAVE_NEW_VALUE: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Ascend fwd_h for K=64: 2×BK state slabs, BC=16 time tiles (fits UB)."""
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_h = i_nh // HV, i_nh % HV
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        NT = tl.cdiv(T, BT)
+        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+    else:
+        bos, eos = i_n * T, i_n * T + T
+        NT = tl.cdiv(T, BT)
+        boh = i_n * NT
+
+    if STATE_V_FIRST:
+        b_h0 = tl.zeros([BV, BK], dtype=tl.float32)
+        b_h1 = tl.zeros([BV, BK], dtype=tl.float32)
+    else:
+        b_h0 = tl.zeros([BK, BV], dtype=tl.float32)
+        b_h1 = tl.zeros([BK, BV], dtype=tl.float32)
+
+    h += (boh * HV + i_h).to(tl.int64) * K * V
+    v += (bos * HV + i_h).to(tl.int64) * V
+    k += (bos * H + i_h // (HV // H)).to(tl.int64) * K
+    w += (bos * HV + i_h).to(tl.int64) * K
+    if SAVE_NEW_VALUE:
+        v_new += (bos * HV + i_h).to(tl.int64) * V
+    if USE_INITIAL_STATE:
+        h0 = h0 + i_nh * K * V
+    if STORE_FINAL_STATE:
+        ht = ht + i_nh * K * V
+
+    if USE_INITIAL_STATE:
+        if STATE_V_FIRST:
+            b_h0 += tl.load(tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, BK), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+            b_h1 += tl.load(tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, BK), (BV, BK), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+        else:
+            b_h0 += tl.load(tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (BK, BV), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+            b_h1 += tl.load(tl.make_block_ptr(h0, (K, V), (V, 1), (BK, i_v * BV), (BK, BV), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+
+    for i_t in range(NT):
+        i_t64 = i_t.to(tl.int64)
+        if STATE_V_FIRST:
+            tl.store(tl.make_block_ptr(h + i_t64 * HV * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, BK), (1, 0)), b_h0.to(h.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(tl.make_block_ptr(h + i_t64 * HV * K * V, (V, K), (K, 1), (i_v * BV, BK), (BV, BK), (1, 0)), b_h1.to(h.dtype.element_ty), boundary_check=(0, 1))
+        else:
+            tl.store(tl.make_block_ptr(h + i_t64 * HV * K * V, (K, V), (V, 1), (0, i_v * BV), (BK, BV), (1, 0)), b_h0.to(h.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(tl.make_block_ptr(h + i_t64 * HV * K * V, (K, V), (V, 1), (BK, i_v * BV), (BK, BV), (1, 0)), b_h1.to(h.dtype.element_ty), boundary_check=(0, 1))
+
+        last_idx = min((i_t + 1) * BT, T) - 1
+        for i_bc in range(BT // BC):
+            t_off = i_t * BT + i_bc * BC
+            b_v = tl.zeros([BC, BV], dtype=tl.float32)
+            p_w = tl.make_block_ptr(w, (T, K), (HV * K, 1), (t_off, 0), (BC, BK), (1, 0))
+            b_w = tl.load(p_w, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_v += tl.dot(b_w, tl.trans(b_h0).to(b_w.dtype))
+            else:
+                b_v += tl.dot(b_w, b_h0.to(b_w.dtype))
+            p_w = tl.make_block_ptr(w, (T, K), (HV * K, 1), (t_off, BK), (BC, BK), (1, 0))
+            b_w = tl.load(p_w, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_v += tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
+            else:
+                b_v += tl.dot(b_w, b_h1.to(b_w.dtype))
+
+            p_v = tl.make_block_ptr(v, (T, V), (HV * V, 1), (t_off, i_v * BV), (BC, BV), (1, 0))
+            b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32) - b_v
+
+            if SAVE_NEW_VALUE:
+                p_vn = tl.make_block_ptr(v_new, (T, V), (HV * V, 1), (t_off, i_v * BV), (BC, BV), (1, 0))
+                tl.store(p_vn, b_v.to(p_vn.dtype.element_ty), boundary_check=(0, 1))
+
+            if USE_G:
+                m_t = (t_off + tl.arange(0, BC)) < T
+                b_g_last = tl.load(g + (bos * HV + last_idx * HV + i_h).to(tl.int64)).to(tl.float32)
+                p_g = tl.make_block_ptr(g + (bos * HV + i_h).to(tl.int64), (T,), (HV,), (t_off,), (BC,), (0,))
+                b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+                b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
+
+            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (0, t_off), (BK, BC), (0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_h0 += tl.trans(tl.dot(b_k, b_v.to(b_k.dtype)))
+            else:
+                b_h0 += tl.dot(b_k, b_v.to(b_k.dtype))
+            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (BK, t_off), (BK, BC), (0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_h1 += tl.trans(tl.dot(b_k, b_v.to(b_k.dtype)))
+            else:
+                b_h1 += tl.dot(b_k, b_v.to(b_k.dtype))
+
+        if USE_G:
+            b_g_last = exp2(tl.load(g + (bos * HV + last_idx * HV + i_h).to(tl.int64)).to(tl.float32))
+            b_h0 *= b_g_last
+            b_h1 *= b_g_last
+        if USE_GK:
+            o_k = tl.arange(0, BK)
+            b_gk0 = tl.load(gk + (bos + last_idx) * HV * K + i_h * K + o_k, mask=(o_k < K), other=0.).to(tl.float32)
+            b_gk1 = tl.load(gk + (bos + last_idx) * HV * K + i_h * K + BK + o_k, mask=(BK + o_k < K), other=0.).to(tl.float32)
+            if STATE_V_FIRST:
+                b_h0 *= exp2(b_gk0)[None, :]
+                b_h1 *= exp2(b_gk1)[None, :]
+            else:
+                b_h0 *= exp2(b_gk0)[:, None]
+                b_h1 *= exp2(b_gk1)[:, None]
+
+    if STORE_FINAL_STATE:
+        if STATE_V_FIRST:
+            tl.store(tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, BK), (1, 0)), b_h0.to(ht.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, BK), (BV, BK), (1, 0)), b_h1.to(ht.dtype.element_ty), boundary_check=(0, 1))
+        else:
+            tl.store(tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (BK, BV), (1, 0)), b_h0.to(ht.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(tl.make_block_ptr(ht, (K, V), (V, 1), (BK, i_v * BV), (BK, BV), (1, 0)), b_h1.to(ht.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_GK': lambda args: args['gk'] is not None,
     'USE_INITIAL_STATE': lambda args: args['dh0'] is not None,
     'USE_FINAL_STATE_GRADIENT': lambda args: args['dht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@fla_cache_autotune(
-    configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
-    use_cuda_graph=USE_CUDA_GRAPH,
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     q,
@@ -334,6 +486,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
+    BC: tl.constexpr,
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -449,6 +602,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         p_do = tl.make_block_ptr(do, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
         b_do = tl.load(p_do, boundary_check=(0, 1))
+        m_t = (i_t * BT + tl.arange(0, BT)) < T
+        b_do = tl.where(m_t[:, None], b_do, 0.0)
 
         # Update dv
         p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
@@ -495,7 +650,6 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
 
         if USE_G:
-            m_t = (i_t * BT + tl.arange(0, BT)) < T
             b_dv *= tl.where(m_t, exp2(bg_last - b_g), 0)[:, None]
         b_dv += tl.load(p_dv, boundary_check=(0, 1))
 
@@ -630,8 +784,9 @@ def chunk_gated_delta_rule_fwd_h(
         final_state = k.new_zeros(N, HV, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
-    def grid(meta): return (triton.cdiv(V, meta['BV']), N*HV)
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+    assert BT % NPU_BC == 0, f"chunk_size {BT} must be divisible by NPU_BC {NPU_BC}"
+    grid = (triton.cdiv(V, NPU_BV), N * HV)
+    launch = dict(
         k=k,
         v=u,
         w=w,
@@ -649,8 +804,15 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        BV=NPU_BV,
+        BC=NPU_BC,
         STATE_V_FIRST=state_v_first,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
+    # K=64: use blockdim64 with BC=64 (one tile per chunk, same as GPU). k64_npu and BC=16
+    # both caused aicore timeout or ht mismatch on partial-length sequences (T % BT != 0).
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](**launch)
     return h, v_new, final_state
 
 
@@ -689,7 +851,8 @@ def chunk_gated_delta_rule_bwd_dhu(
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
 
-    def grid(meta): return (triton.cdiv(V, meta['BV']), N*HV)
+    assert BT % NPU_BC == 0, f"chunk_size {BT} must be divisible by NPU_BC {NPU_BC}"
+    grid = (triton.cdiv(V, NPU_BV), N * HV)
     chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64[grid](
         q=q,
         k=k,
@@ -711,6 +874,10 @@ def chunk_gated_delta_rule_bwd_dhu(
         K=K,
         V=V,
         BT=BT,
+        BV=NPU_BV,
+        BC=NPU_BC,
         STATE_V_FIRST=state_v_first,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
     return dh, dh0, dv2

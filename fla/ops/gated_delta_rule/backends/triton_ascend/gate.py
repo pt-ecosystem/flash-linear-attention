@@ -10,11 +10,13 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.ops.utils.op import exp
 from fla.ops.utils.softplus import softplus
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, input_guard
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+
+NPU_NUM_WARPS = 2
+NPU_NUM_STAGES = 1
 
 
 def naive_gdn_gate(
@@ -50,14 +52,6 @@ def naive_gdn_gate(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@fla_cache_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=['H', 'BT', 'IS_VARLEN', 'REVERSE'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def gdn_gate_chunk_cumsum_scalar_kernel(
     g,
@@ -106,14 +100,6 @@ def gdn_gate_chunk_cumsum_scalar_kernel(
 @triton.heuristics({
     'HAS_BIAS': lambda args: args['dt_bias'] is not None,
 })
-@fla_cache_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=['H', 'BT'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def gdn_gate_bwd_kernel(
     g,
@@ -183,6 +169,8 @@ def gdn_gate_chunk_cumsum(
         H=H,
         BT=BT,
         REVERSE=False,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
     return o
 
@@ -211,6 +199,8 @@ def gdn_gate_bwd(
         T=T,
         H=H,
         BT=BT,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
 
     dg = dg.view_as(g).type_as(g)
@@ -223,16 +213,6 @@ def gdn_gate_bwd(
 @triton.heuristics({
     'HAS_BIAS': lambda args: args['dt_bias'] is not None,
 })
-@fla_cache_autotune(
-    configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps, num_stages=num_stages)
-        for BT in [32, 64, 128]
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3]
-    ],
-    key=['H'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def gdn_gate_fwd_kernel(
     g,
@@ -267,17 +247,18 @@ def gdn_gate_fwd(
     T = g.numel() // H
 
     yg = torch.empty_like(g, dtype=output_dtype)
+    BT = 32
 
-    def grid(meta):
-        return (triton.cdiv(T, meta['BT']), H)
-
-    gdn_gate_fwd_kernel[grid](
+    gdn_gate_fwd_kernel[(triton.cdiv(T, BT), H)](
         g=g,
         A_log=A_log,
         dt_bias=dt_bias,
         yg=yg,
         T=T,
         H=H,
+        BT=BT,
+        num_warps=NPU_NUM_WARPS,
+        num_stages=NPU_NUM_STAGES,
     )
     return yg
 
