@@ -243,24 +243,19 @@ def prepare_wy_repr_bwd_build_kernel(
                 du + (bos * HV + i_h) * V, (T, V), (HV * V, 1),
                 (i_t * BT + t_ra, i_v * BV), (BC, BV), (1, 0),
             )
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_v_row = tl.load(p_v_row, boundary_check=(0, 1))
+            b_du = tl.load(p_du, boundary_check=(0, 1)).to(tl.float32)
+            b_vb = (b_v * b_b[:, None]).to(tl.float32)
+            b_dA_row += tl.dot(b_du, tl.trans(b_vb), allow_tf32=False)
             p_du_full = tl.make_block_ptr(
                 du + (bos * HV + i_h) * V, (T, V), (HV * V, 1),
                 (i_t * BT, i_v * BV), (BT, BV), (1, 0),
             )
-            p_dv = tl.make_block_ptr(
-                dv + (bos * HV + i_h) * V, (T, V), (HV * V, 1),
-                (i_t * BT + t_ra, i_v * BV), (BC, BV), (1, 0),
-            )
-            b_v = tl.load(p_v, boundary_check=(0, 1))
-            b_v_row = tl.load(p_v_row, boundary_check=(0, 1))
-            b_du = tl.load(p_du, boundary_check=(0, 1)).to(tl.float32)
             b_du_full = tl.load(p_du_full, boundary_check=(0, 1)).to(tl.float32)
-            b_vb = (b_v * b_b[:, None]).to(tl.float32)
-            b_dA_row += tl.dot(b_du, tl.trans(b_vb), allow_tf32=False)
             b_dvb = tl.dot(b_A_row, b_du_full, allow_tf32=False)
-            b_dv = (b_dvb * b_b_row[:, None]).to(b_v.dtype)
             b_db_row += tl.sum(b_dvb * b_v_row.to(tl.float32), 1)
-            tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+            # dv via _compute_wy_dv_host; NPU tl.store to dv is unreliable.
 
         m_causal = (o_row[:, None] > o_col[None, :]) & (m_row[:, None] & m_col[None, :])
         b_dA_row = tl.where(m_causal, b_dA_row, 0.0)
@@ -496,6 +491,108 @@ def recompute_w_u_fwd(
     return w, u
 
 
+def _to_host_dense(x: torch.Tensor) -> torch.Tensor:
+    """NPU internal/sparse layouts -> dense float CPU (permute/matmul safe)."""
+    if x.device.type == 'npu':
+        x = x.clone()
+    y = x.detach().float()
+    if y.device.type != 'cpu':
+        y = y.cpu()
+    if y.is_sparse or y.layout != torch.strided:
+        y = y.to_dense() if y.is_sparse else torch.tensor(y.numpy(), dtype=torch.float32)
+    return y.contiguous()
+
+
+def _compute_wy_dv_host(
+    du: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    T: int,
+    BT: int,
+) -> torch.Tensor:
+    """dv = (A @ du) * beta per chunk; matches GPU prepare_wy_repr_bwd (T, BT) A layout."""
+    out_dtype = du.dtype
+    device = du.device
+    on_npu = device.type == 'npu'
+    B, _, HV, V = du.shape
+    dv = torch.zeros(B, T, HV, V, dtype=out_dtype, device=device)
+    du_w = du.float().contiguous() if not on_npu else None
+    beta_w = beta.float().contiguous() if not on_npu else None
+    A_w = A.float().contiguous() if not on_npu else None
+    for i_t in range(triton.cdiv(T, BT)):
+        t0 = i_t * BT
+        t1 = min(t0 + BT, T)
+        n = t1 - t0
+        if n == 0:
+            continue
+        o = torch.arange(n)
+        if on_npu:
+            du_c = _to_host_dense(du[:, t0:t1]).permute(0, 2, 1, 3)
+            # beta is [B, T, HV] (3D); do not use 4D permute like du.
+            beta_c = _to_host_dense(beta[:, t0:t1]).permute(0, 2, 1).unsqueeze(-1)
+            a = _to_host_dense(A[:, t0:t1, :, :n]).permute(0, 2, 1, 3)
+        else:
+            du_c = du_w[:, t0:t1, :, :].permute(0, 2, 1, 3)
+            beta_c = beta_w[:, t0:t1, :].permute(0, 2, 1).unsqueeze(-1)
+            a = A_w[:, t0:t1, :, :n].permute(0, 2, 1, 3)
+        mask = (o[:, None] > o[None, :]).to(du_c.dtype)
+        a = a * mask
+        dvb = torch.matmul(a, du_c)
+        b = beta_c
+        chunk = (dvb * b).permute(0, 2, 1, 3).to(out_dtype)
+        if on_npu:
+            dv[:, t0:t1].copy_(chunk.to(device=device, non_blocking=True))
+        else:
+            dv[:, t0:t1] = chunk
+    return dv
+
+
+def _apply_wy_da_sandwich_host(
+    dA: torch.Tensor,
+    A: torch.Tensor,
+    g: torch.Tensor | None,
+    T: int,
+    BT: int,
+) -> None:
+    """Sandwich dA on CPU per chunk; avoids NPU prepare_wy_repr_bwd_sandwich_kernel timeout."""
+    B, _, HV, _ = dA.shape
+    on_npu = dA.device.type == 'npu'
+    o = torch.arange(BT)
+    strict_lower = o[:, None] > o[None, :]
+    for i_t in range(triton.cdiv(T, BT)):
+        t0 = i_t * BT
+        t1 = min(t0 + BT, T)
+        n = t1 - t0
+        if n == 0:
+            continue
+        m_bool = strict_lower[:n, :n]
+        if on_npu:
+            da = _to_host_dense(dA[:, t0:t1, :, :n]).permute(0, 2, 1, 3)
+            a = _to_host_dense(A[:, t0:t1, :, :n]).permute(0, 2, 1, 3)
+            g_chunk = _to_host_dense(g[:, t0:t1, :]) if g is not None else None
+        else:
+            da = dA[:, t0:t1, :, :n].float().permute(0, 2, 1, 3)
+            a = A[:, t0:t1, :, :n].float().permute(0, 2, 1, 3)
+            g_chunk = g[:, t0:t1, :].float() if g is not None else None
+        da = da * m_bool.view(1, 1, n, n).to(da.dtype)
+        da = da.reshape(B * HV, n, n)
+        a = a.reshape(B * HV, n, n)
+        da = torch.bmm(da, a)
+        da = torch.bmm(a, da)
+        if g_chunk is not None:
+            gb = g_chunk.permute(0, 2, 1).reshape(B * HV, n)
+            if n < BT:
+                gb = torch.nn.functional.pad(gb, (0, BT - n))
+            gdiff = torch.exp2(gb[:, :, None] - gb[:, None, :])
+            da = da * gdiff[:, :n, :n]
+        da = torch.where(m_bool.unsqueeze(0), -da[:, :n, :n], torch.zeros_like(da[:, :n, :n]))
+        da_phys = da.reshape(B, HV, n, n).permute(0, 2, 1, 3).to(dA.dtype)
+        if on_npu:
+            dA[:, t0:t1, :, :n].copy_(da_phys.to(device=dA.device, non_blocking=True))
+        else:
+            dA[:, t0:t1, :, :n] = da_phys
+
+
 def prepare_wy_repr_bwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -552,12 +649,8 @@ def prepare_wy_repr_bwd(
         BV=BV,
         **launch,
     )
-    prepare_wy_repr_bwd_sandwich_kernel[grid](
-        g=g,
-        A=A,
-        dA=dA,
-        **launch,
-    )
+    dv = _compute_wy_dv_host(du=du, beta=beta, A=A, T=T, BT=BT)
+    _apply_wy_da_sandwich_host(dA=dA, A=A, g=g, T=T, BT=BT)
     prepare_wy_repr_bwd_finish_kernel[grid](
         k=k,
         beta=beta,

@@ -230,7 +230,14 @@ def chunk_gated_delta_rule_bwd(
     )
     dk.add_(dk2)
     dg.add_(dg2)
-    dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
+    dg = chunk_local_cumsum(
+        dg,
+        chunk_size=64,
+        reverse=True,
+        scale=RCP_LN2,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
     dA_log, ddt_bias = None, None
     if use_gate_in_kernel:
         dg, dA_log, ddt_bias = gdn_gate_bwd(g=g_input, A_log=A_log, dt_bias=dt_bias, dyg=dg)
