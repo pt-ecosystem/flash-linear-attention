@@ -602,8 +602,6 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         p_do = tl.make_block_ptr(do, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
         b_do = tl.load(p_do, boundary_check=(0, 1))
-        m_t = (i_t * BT + tl.arange(0, BT)) < T
-        b_do = tl.where(m_t[:, None], b_do, 0.0)
 
         # Update dv
         p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
@@ -650,6 +648,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
 
         if USE_G:
+            m_t = (i_t * BT + tl.arange(0, BT)) < T
             b_dv *= tl.where(m_t, exp2(bg_last - b_g), 0)[:, None]
         b_dv += tl.load(p_dv, boundary_check=(0, 1))
 
