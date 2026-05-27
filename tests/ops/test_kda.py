@@ -16,7 +16,7 @@ from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
 from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate, naive_kda_lowerbound_gate
 from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from fla.ops.utils.cache import FLA_CACHE_MODE
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device, is_npu_available
+from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 @pytest.mark.parametrize(
@@ -381,35 +381,30 @@ def test_fused_recurrent_vllm_decode(
 ):
     """Test vLLM-style decoding with continuous batching and paged state storage."""
     torch.manual_seed(42)
-    if torch.cuda.is_available():
-        test_device = torch.device("cuda")
-    elif is_npu_available():
-        test_device = torch.device("npu")
-    else:
-        pytest.skip("requires CUDA or Ascend NPU")
+    device = torch.device("cuda")
 
     # Setup cache pool and inputs
     max_cache_slots = B * 3
-    state_pool = torch.randn(max_cache_slots, H, D, D, dtype=torch.float32, device=test_device)
-    state_indices = torch.randperm(max_cache_slots, device=test_device)[:B].int()
+    state_pool = torch.randn(max_cache_slots, H, D, D, dtype=torch.float32, device=device)
+    state_indices = torch.randperm(max_cache_slots, device=device)[:B].int()
 
     # Fill unaccessed slots with a huge value to detect out-of-bound access
     HUGE_VALUE = 1e30
-    mask = torch.ones(max_cache_slots, dtype=torch.bool, device=test_device)
+    mask = torch.ones(max_cache_slots, dtype=torch.bool, device=device)
     mask[state_indices.long()] = False
     state_pool[mask] = HUGE_VALUE
 
     T = 1
     total_tokens = B * T
 
-    q = torch.rand(1, total_tokens, H, D, dtype=dtype, device=test_device)
-    k = torch.rand(1, total_tokens, H, D, dtype=dtype, device=test_device)
-    v = torch.rand(1, total_tokens, H, D, dtype=dtype, device=test_device)
-    g = torch.randn(1, total_tokens, H, D, dtype=torch.float if not use_gate_in_kernel else dtype, device=test_device)
+    q = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
+    k = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
+    v = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
+    g = torch.randn(1, total_tokens, H, D, dtype=torch.float if not use_gate_in_kernel else dtype, device=device)
 
     if use_gate_in_kernel:
-        A_log = torch.log(torch.randn(1, 1, H, 1, dtype=torch.float32, device=test_device).uniform_(1, 16)).squeeze()
-        dt_bias = torch.randn(H * D, dtype=torch.float32, device=test_device)
+        A_log = torch.log(torch.randn(1, 1, H, 1, dtype=torch.float32, device=device).uniform_(1, 16)).squeeze()
+        dt_bias = torch.randn(H * D, dtype=torch.float32, device=device)
         lower_bound = -5.0 if safe_gate else None
         naive_kda_gate_fn = naive_kda_lowerbound_gate if safe_gate else naive_kda_gate
     else:
@@ -419,9 +414,9 @@ def test_fused_recurrent_vllm_decode(
         lower_bound = None
         naive_kda_gate_fn = None
 
-    beta = torch.randn(1, total_tokens, H, dtype=dtype, device=test_device).sigmoid()
+    beta = torch.randn(1, total_tokens, H, dtype=dtype, device=device).sigmoid()
 
-    cu_seqlens = torch.arange(0, total_tokens + 1, step=T, device=test_device, dtype=torch.int32)
+    cu_seqlens = torch.arange(0, total_tokens + 1, step=T, device=device, dtype=torch.int32)
     ref_state_pool = state_pool.clone()
     tri_state_pool = state_pool.clone()
 
@@ -484,7 +479,7 @@ def test_fused_recurrent_vllm_decode(
     assert_close("o", ref_out, tri_out, 0.005)
     assert_close("ht", ref_state_pool[state_indices.long()], tri_state_pool[state_indices.long()], 0.005)
 
-    mask = torch.ones(max_cache_slots, dtype=torch.bool, device=test_device)
+    mask = torch.ones(max_cache_slots, dtype=torch.bool, device=device)
     mask[state_indices.long()] = False
     assert_close("Untouched ht", ref_state_pool[mask], tri_state_pool[mask], 0.0)
 

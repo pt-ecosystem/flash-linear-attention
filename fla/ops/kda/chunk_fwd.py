@@ -7,7 +7,6 @@
 
 import torch
 
-from fla.ops.backends import dispatch
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import chunk_gated_delta_rule_fwd_h_pre_process, compress_h0
@@ -18,7 +17,6 @@ from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 
 
-@dispatch('kda')
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
