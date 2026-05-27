@@ -143,7 +143,7 @@ def prepare_wy_repr_bwd_build_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    # A/dA chunk matrices use (T, BT) layout, same as chunk_scaled_dot_kkt / recompute_w_u_fwd.
+    # Physical storage is (T, BT) from kkt; GPU wy_fast uses b_A[r,c] = A_phys[t_chunk+c, r].
     A_base = A + (bos * HV + i_h) * BT
     dA_base = dA + (bos * HV + i_h) * BT
     t_chunk = i_t * BT
@@ -160,22 +160,21 @@ def prepare_wy_repr_bwd_build_kernel(
     # phase 1: build raw dA row strips in GM (max tile [BC, BT] in UB)
     for i_ra in range(BT // BC):
         t_ra = i_ra * BC
-        p_dA_row = tl.make_block_ptr(
-            dA_base, (T, BT), (HV * BT, 1), (t_chunk + t_ra, 0), (BC, BT), (1, 0),
-        )
         b_dA_row = tl.zeros([BC, BT], dtype=tl.float32)
-        p_A_row = tl.make_block_ptr(
-            A_base, (T, BT), (HV * BT, 1), (t_chunk + t_ra, 0), (BC, BT), (1, 0),
+        p_A_gpu = tl.make_block_ptr(
+            A_base, (T, BT), (HV * BT, 1), (t_chunk, t_ra), (BT, BC), (1, 0),
         )
-        o_col = i_t * BT + tl.arange(0, BT)
-        o_row = i_t * BT + t_ra + tl.arange(0, BC)
-        m_row = o_row < T
-        m_col = o_col < T
-        b_A_row = tl.load(p_A_row, boundary_check=(0, 1)).to(tl.float32)
-        # A is torch.empty from kkt; only strict-lower entries are written — mask before use.
-        b_A_row = tl.where(
-            (o_row[:, None] > o_col[None, :]) & (m_row[:, None] & m_col[None, :]),
-            b_A_row,
+        o_j = t_chunk + tl.arange(0, BT)
+        o_i = t_chunk + t_ra + tl.arange(0, BC)
+        m_j = o_j < T
+        m_i = o_i < T
+        m_valid = m_j[:, None] & m_i[None, :]
+        b_A_gpu = tl.load(p_A_gpu, boundary_check=(0, 1)).to(tl.float32)
+        # b_A_gpu[j,ir] = A_phys[t_chunk+j, t_ra+ir]; GPU b_A[r,c]=A_phys[t_chunk+c,r].
+        # dk[r]=sum_c b_A[r,c]*dw[c] => dk[t_ra+ir]=sum_j b_A_gpu[j,ir]*dw[j] (GPU dot(b_A,dw)).
+        b_A_lower = tl.where(
+            (o_i[None, :] >= o_j[:, None]) & m_valid,
+            b_A_gpu,
             0.0,
         )
         p_b_row = tl.make_block_ptr(beta + (bos * HV + i_h), (T,), (HV,), (i_t * BT + t_ra,), (BC,), (0,))
@@ -219,12 +218,15 @@ def prepare_wy_repr_bwd_build_kernel(
             else:
                 b_kbg = b_k * b_b[:, None]
             b_dA_row += tl.dot(b_dw_row, tl.trans(b_kbg), allow_tf32=False)
-            b_dkbg = tl.dot(b_A_row, b_dw, allow_tf32=False)
+            b_dkbg = tl.dot(tl.trans(b_A_gpu), b_dw, allow_tf32=False)
             if USE_G:
                 b_kbg_row = b_k_row * b_b_row[:, None] * b_g_exp_row[:, None]
                 b_dk = b_dkbg * (b_g_exp_row * b_b_row)[:, None]
                 b_db_row += tl.sum(b_dkbg * b_k_row * b_g_exp_row[:, None], 1)
-                b_dg_row += tl.sum(b_dkbg * b_kbg_row, 1)
+                b_dg_row += tl.sum(
+                    tl.dot(tl.trans(b_A_lower), b_dw, allow_tf32=False) * b_kbg_row,
+                    1,
+                )
             else:
                 b_dk = b_dkbg * b_b_row[:, None]
                 b_db_row += tl.sum(b_dkbg * b_k_row, 1)
@@ -257,14 +259,19 @@ def prepare_wy_repr_bwd_build_kernel(
             b_du_full = tl.load(p_du_full, boundary_check=(0, 1)).to(tl.float32)
             b_vb = (b_v * b_b[:, None]).to(tl.float32)
             b_dA_row += tl.dot(b_du, tl.trans(b_vb), allow_tf32=False)
-            b_dvb = tl.dot(b_A_row, b_du_full, allow_tf32=False)
-            b_dv = (b_dvb * b_b_row[:, None]).to(b_v.dtype)
+            b_dvb = tl.dot(tl.trans(b_A_gpu), b_du_full, allow_tf32=False)
+            b_dv = b_dvb * b_b_row[:, None]
             b_db_row += tl.sum(b_dvb * b_v_row.to(tl.float32), 1)
             tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
-        m_causal = (o_row[:, None] > o_col[None, :]) & (m_row[:, None] & m_col[None, :])
+        o_causal_col = tl.arange(0, BT)
+        m_causal = (t_ra + tl.arange(0, BC))[:, None] > o_causal_col[None, :]
         b_dA_row = tl.where(m_causal, b_dA_row, 0.0)
-        tl.store(p_dA_row, b_dA_row, boundary_check=(0, 1))
+        # dA_gpu[r,c] lives at A_phys[t_chunk+c, r]; b_dA_row[i,j] is gpu[t_ra+i, j].
+        p_dA_gpu = tl.make_block_ptr(
+            dA_base, (T, BT), (HV * BT, 1), (t_chunk, t_ra), (BT, BC), (1, 0),
+        )
+        tl.store(p_dA_gpu, tl.trans(b_dA_row), boundary_check=(0, 1))
         tl.store(p_db_row, b_db_row.to(p_db_row.dtype.element_ty), boundary_check=(0,))
         if USE_G:
             tl.store(p_dg_row, b_dg_row.to(p_dg_row.dtype.element_ty), boundary_check=(0,))
@@ -314,20 +321,20 @@ def prepare_wy_repr_bwd_sandwich_kernel(
             for i_a in range(BT // BC):
                 t_a = i_a * BC
                 p_A_ir = tl.make_block_ptr(
-                    A_base, (T, BT), (HV * BT, 1), (t_chunk + t_r, t_a), (BC, BC), (1, 0),
+                    A_base, (T, BT), (HV * BT, 1), (t_chunk + t_a, t_r), (BC, BC), (1, 0),
                 )
-                b_A_ir = tl.load(p_A_ir, boundary_check=(0, 1)).to(tl.float32)
+                b_A_ir = tl.trans(tl.load(p_A_ir, boundary_check=(0, 1)).to(tl.float32))
                 temp = tl.zeros([BC, BC], dtype=tl.float32)
                 for i_b in range(BT // BC):
                     t_b = i_b * BC
                     p_dM = tl.make_block_ptr(
-                        dA_base, (T, BT), (HV * BT, 1), (t_chunk + t_a, t_b), (BC, BC), (1, 0),
+                        dA_base, (T, BT), (HV * BT, 1), (t_chunk + t_b, t_a), (BC, BC), (1, 0),
                     )
                     p_A_bc = tl.make_block_ptr(
-                        A_base, (T, BT), (HV * BT, 1), (t_chunk + t_b, t_c), (BC, BC), (1, 0),
+                        A_base, (T, BT), (HV * BT, 1), (t_chunk + t_c, t_b), (BC, BC), (1, 0),
                     )
-                    b_dM = tl.load(p_dM, boundary_check=(0, 1)).to(tl.float32)
-                    b_A_bc = tl.load(p_A_bc, boundary_check=(0, 1)).to(tl.float32)
+                    b_dM = tl.trans(tl.load(p_dM, boundary_check=(0, 1)).to(tl.float32))
+                    b_A_bc = tl.trans(tl.load(p_A_bc, boundary_check=(0, 1)).to(tl.float32))
                     temp += tl.dot(b_dM, b_A_bc, allow_tf32=False)
                 acc += tl.dot(b_A_ir, temp, allow_tf32=False)
             if USE_G:
@@ -338,9 +345,9 @@ def prepare_wy_repr_bwd_sandwich_kernel(
                 acc = acc * exp2(b_g_r[:, None] - b_g_c[None, :])
             acc = tl.where(m_blk, -acc, 0.0)
             p_dA_out = tl.make_block_ptr(
-                dA_base, (T, BT), (HV * BT, 1), (t_chunk + t_r, t_c), (BC, BC), (1, 0),
+                dA_base, (T, BT), (HV * BT, 1), (t_chunk + t_c, t_r), (BC, BC), (1, 0),
             )
-            tl.store(p_dA_out, acc, boundary_check=(0, 1))
+            tl.store(p_dA_out, tl.trans(acc), boundary_check=(0, 1))
 
 
 @triton.heuristics({
@@ -414,12 +421,14 @@ def prepare_wy_repr_bwd_finish_kernel(
             )
             b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
             b_k_row = tl.load(p_k_row, boundary_check=(0, 1)).to(tl.float32)
-            b_dkb = tl.dot(b_dA_r, b_k, allow_tf32=False)
+            # dA stored (T,BT): dA_fwd[row,col]=dA_phys[t+row,col]; GPU dA_g[r,c]=dA_fwd[c,r].
+            # b_dkb = dA_g @ k = dA_fwd.T @ k  -> dot(trans(b_dA_cols), k)
+            # dk2 = trans(dot(trans(kb), dA_g)) = dA_fwd @ kb -> dot(b_dA_r, kb)
+            b_dkb = tl.dot(tl.trans(b_dA_cols), b_k, allow_tf32=False)
             b_db_row += tl.sum(b_dkb * b_k_row, 1)
             b_kb = b_k * b_b[:, None]
-            # Match GPU: dk += trans(dot(trans(kb), dA)); dk2[t,b] = sum_s kb[s,b]*dA[s,t]
             b_dk = b_dkb * b_b_row[:, None] + tl.dot(
-                tl.trans(b_dA_cols), b_kb.to(tl.float32), allow_tf32=False,
+                b_dA_r, b_kb.to(tl.float32), allow_tf32=False,
             )
             b_dk += tl.load(p_dk, boundary_check=(0, 1)).to(tl.float32)
             tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
@@ -496,17 +505,21 @@ def recompute_w_u_fwd(
     return w, u
 
 
-def prepare_wy_repr_bwd(
+def _prepare_wy_repr_bwd_launch(
     k: torch.Tensor,
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
     dw: torch.Tensor,
     du: torch.Tensor,
-    g: torch.Tensor = None,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    g: torch.Tensor | None,
+    cu_seqlens: torch.LongTensor | None,
+    chunk_indices: torch.LongTensor | None,
+    *,
+    run_build: bool = True,
+    run_sandwich: bool = True,
+    run_finish: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = A.shape[-1]
     assert BT % NPU_BC == 0, f'chunk size {BT} must be divisible by NPU_BC {NPU_BC}'
@@ -532,48 +545,69 @@ def prepare_wy_repr_bwd(
         num_warps=NPU_NUM_WARPS,
         num_stages=NPU_NUM_STAGES,
     )
-    prepare_wy_repr_bwd_build_kernel[grid](
-        k=k,
-        v=v,
-        beta=beta,
-        g=g,
-        A=A,
-        dA=dA,
-        dw=dw,
-        du=du,
-        dk=dk,
-        dv=dv,
-        db=db,
-        dg=dg,
-        H=H,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        **launch,
-    )
-    prepare_wy_repr_bwd_sandwich_kernel[grid](
-        g=g,
-        A=A,
-        dA=dA,
-        **launch,
-    )
-    prepare_wy_repr_bwd_finish_kernel[grid](
-        k=k,
-        beta=beta,
-        g=g,
-        A=A,
-        dA=dA,
-        dk=dk,
-        db=db,
-        dg=dg,
-        H=H,
-        K=K,
-        BK=BK,
-        **launch,
-    )
+    if run_build:
+        prepare_wy_repr_bwd_build_kernel[grid](
+            k=k,
+            v=v,
+            beta=beta,
+            g=g,
+            A=A,
+            dA=dA,
+            dw=dw,
+            du=du,
+            dk=dk,
+            dv=dv,
+            db=db,
+            dg=dg,
+            H=H,
+            K=K,
+            V=V,
+            BK=BK,
+            BV=BV,
+            **launch,
+        )
+    if run_sandwich:
+        prepare_wy_repr_bwd_sandwich_kernel[grid](
+            g=g,
+            A=A,
+            dA=dA,
+            **launch,
+        )
+    if run_finish:
+        prepare_wy_repr_bwd_finish_kernel[grid](
+            k=k,
+            beta=beta,
+            g=g,
+            A=A,
+            dA=dA,
+            dk=dk,
+            db=db,
+            dg=dg,
+            H=H,
+            K=K,
+            BK=BK,
+            **launch,
+        )
     if H != HV:
         dk = dk.view(B, T, H, HV // H, K).sum(3)
+    return dk, dv, db, dg, dA
+
+
+def prepare_wy_repr_bwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    dw: torch.Tensor,
+    du: torch.Tensor,
+    g: torch.Tensor = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dk, dv, db, dg, _ = _prepare_wy_repr_bwd_launch(
+        k, v, beta, A, dw, du, g, cu_seqlens, chunk_indices,
+        run_build=True, run_sandwich=True, run_finish=True,
+    )
     return dk, dv, db, dg
 
 

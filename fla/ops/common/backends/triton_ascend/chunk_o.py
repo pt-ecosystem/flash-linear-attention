@@ -1199,8 +1199,9 @@ def chunk_bwd_dqkwg(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     NK = triton.cdiv(K, BK)
-    dq = torch.zeros(B, T, HV, K, dtype=q.dtype, device=q.device)
-    dk = torch.zeros(B, T, HV, K, dtype=k.dtype, device=k.device)
+    # fp32 accumulators: dg uses dq/dk after BC tiles; fp16 round-trip biases dg (see #640 NPU).
+    dq = torch.zeros(B, T, HV, K, dtype=torch.float32, device=q.device)
+    dk = torch.zeros(B, T, HV, K, dtype=torch.float32, device=k.device)
     dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
     dw = torch.empty_like(w) if w is not None else None
 
@@ -1242,4 +1243,6 @@ def chunk_bwd_dqkwg(
         dk = dk.view(B, T, H, HV // H, K).sum(3)
     if dg is not None:
         dg = dg.sum(0)
+    dq = dq.to(q.dtype)
+    dk = dk.to(k.dtype)
     return dq, dk, dw, dg
